@@ -1,0 +1,22 @@
+{
+  "docker-project": {
+    "projects": [
+      {
+        "name": "pichost",
+        "path": "docker"
+      }
+    ]
+  },
+  "data-share": {
+    "shares": [
+      {
+        "name": "pichost/data",
+        "permission": {
+          "rw": [
+            "docker-pichost"
+          ]
+        }
+      }
+    ]
+  }
+}

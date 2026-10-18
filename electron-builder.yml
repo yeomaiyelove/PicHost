@@ -1,0 +1,38 @@
+appId: com.yeomai.pichost
+productName: PicHost
+asar: true
+npmRebuild: false
+
+directories:
+  output: dist-windows/release
+  buildResources: dist-windows/staging/build
+
+files:
+  - desktop/**/*
+  - package.json
+  - "!node_modules/**/*"
+
+extraResources:
+  - from: dist-windows/staging/runtime
+    to: runtime
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  icon: icon.png
+  executableName: PicHost
+  artifactName: PicHost-Setup-${version}-${arch}.${ext}
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowElevation: true
+  include: packaging/windows/installer.nsh
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: PicHost
+  uninstallDisplayName: PicHost
+  runAfterFinish: true

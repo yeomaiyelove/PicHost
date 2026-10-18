@@ -1,0 +1,45 @@
+#!/bin/bash
+# 升级 fpk 后：使用飞牛中已导入的本地镜像重建容器（pichost/data 数据目录不变）。
+COMPOSE_DIR="${TRIM_APPDEST}/docker"
+COMPOSE_FILE="${COMPOSE_DIR}/docker-compose.yaml"
+CONTAINER_NAME="pichost"
+
+log_fail() {
+  echo "$1" > "${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+}
+
+if [ ! -f "${COMPOSE_FILE}" ]; then
+  log_fail "找不到 docker-compose.yaml"
+  exit 1
+fi
+
+IMAGE="$(sed -n 's/^[[:space:]]*image:[[:space:]]*//p' "${COMPOSE_FILE}" | head -1 | tr -d ' \r')"
+if [ -z "${IMAGE}" ]; then
+  log_fail "无法从 compose 解析镜像名"
+  exit 1
+fi
+
+# 升级向导不含 port 字段，尽量沿用旧容器端口
+if [ -z "${wizard_port:-}" ] && docker inspect "${CONTAINER_NAME}" >/dev/null 2>&1; then
+  wizard_port="$(docker inspect "${CONTAINER_NAME}" --format '{{with index .HostConfig.PortBindings "6892/tcp"}}{{with index . 0}}{{.HostPort}}{{end}}{{end}}' 2>/dev/null || true)"
+fi
+export wizard_port="${wizard_port:-6892}"
+
+if ! docker compose version >/dev/null 2>&1; then
+  if docker inspect "${CONTAINER_NAME}" >/dev/null 2>&1; then
+    docker restart -t 10 "${CONTAINER_NAME}" >/dev/null 2>&1 || {
+      log_fail "docker compose 不可用，且容器重启失败"
+      exit 1
+    }
+    exit 0
+  fi
+  log_fail "docker compose 不可用，且未找到 ${CONTAINER_NAME} 容器"
+  exit 1
+fi
+
+if ! (cd "${COMPOSE_DIR}" && docker compose up -d --force-recreate); then
+  log_fail "重建容器失败，请检查 Docker 日志（镜像：${IMAGE}）"
+  exit 1
+fi
+
+exit 0

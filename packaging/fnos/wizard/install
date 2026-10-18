@@ -1,0 +1,123 @@
+[
+  {
+    "stepTitle": "安装方式",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "安装前请先在飞牛 Docker 中导入 <strong>yeomaiyelove/pichost:1.5.1</strong> 镜像。PicHost 使用本地镜像，不会自动联网拉取。与 Web 首次设置一致，可选 <strong>创建管理员</strong> 或 <strong>从备份恢复</strong>（<code>.phost.tar.gz</code>）。图片与数据库保存在存储空间 <strong>pichost/data</strong> 共享目录。"
+      },
+      {
+        "type": "radio",
+        "field": "wizard_setup_mode",
+        "label": "安装方式",
+        "initValue": "init",
+        "options": [
+          {
+            "label": "创建管理员（新装）",
+            "value": "init"
+          },
+          {
+            "label": "从备份恢复（换机 / 迁移）",
+            "value": "restore"
+          }
+        ],
+        "rules": [
+          {
+            "required": true,
+            "message": "请选择安装方式"
+          }
+        ]
+      },
+      {
+        "type": "text",
+        "field": "wizard_port",
+        "label": "服务端口",
+        "initValue": "6892",
+        "helpText": "PicHost 在 NAS 上对外访问的端口，默认 6892。请避免与系统或其他应用冲突。",
+        "rules": [
+          {
+            "required": true,
+            "message": "请输入端口号"
+          },
+          {
+            "pattern": "^[0-9]+$",
+            "message": "端口号必须是数字"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "stepTitle": "创建管理员",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "仅在选择 <strong>创建管理员</strong> 时需要填写。安装完成后点击桌面图标即可登录，无需再访问 /setup。"
+      },
+      {
+        "type": "text",
+        "field": "wizard_admin_username",
+        "label": "管理员用户名",
+        "initValue": "admin",
+        "rules": [
+          {
+            "pattern": "^[a-zA-Z0-9_]{3,32}$",
+            "message": "用户名为 3–32 位字母、数字或下划线"
+          }
+        ]
+      },
+      {
+        "type": "password",
+        "field": "wizard_admin_password",
+        "label": "管理员密码",
+        "initValue": "",
+        "rules": [
+          {
+            "min": 8,
+            "message": "密码至少 8 位"
+          }
+        ]
+      },
+      {
+        "type": "switch",
+        "field": "wizard_allow_registration",
+        "label": "允许用户注册",
+        "initValue": "false",
+        "helpText": "开启后，访客可在登录页自行注册普通用户账号；关闭则仅管理员可创建用户。"
+      }
+    ]
+  },
+  {
+    "stepTitle": "从备份恢复",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "仅在选择 <strong>从备份恢复</strong> 时需要填写。请先把 <code>.phost.tar.gz</code> 备份包放到 NAS 上可访问的路径（如共享文件夹），再填写<strong>绝对路径</strong>。恢复完成后请使用<strong>备份包内原有的管理员账号</strong>登录；对象存储密钥需在恢复后重新填写。"
+      },
+      {
+        "type": "text",
+        "field": "wizard_backup_path",
+        "label": "备份文件路径",
+        "initValue": "",
+        "helpText": "示例：<code>/vol1/1000/backups/pichost.phost.tar.gz</code>（路径因 NAS 存储池而异，请按实际填写）"
+      }
+    ]
+  },
+  {
+    "stepTitle": "访问与反向代理（可选）",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "安装后可通过 <strong>http://&lt;NAS IP&gt;:&lt;服务端口&gt;</strong> 或桌面图标进入后台。若使用公网域名，建议在飞牛 <strong>Lucky</strong> 中配置反向代理：前端填域名，后端填 <strong>http://&lt;NAS 内网 IP&gt;:&lt;服务端口&gt;</strong>（如 <code>http://192.168.8.3:6892</code>）。"
+      },
+      {
+        "type": "tips",
+        "helpText": "若希望<strong>管理后台与图片直链使用不同域名</strong>，安装完成后在 <strong>设置 → 域名与链接</strong> 中启用「后台与图片域名分离」，并在 Lucky 为两个域名各建一条反向代理，<strong>后端地址相同</strong>即可。详见 <a href=\"https://o96u.github.io/PicHost/guide/domain-separation.html\" target=\"_blank\">双域名分离文档</a>。"
+      },
+      {
+        "type": "tips",
+        "helpText": "日常整站备份/跨后端同步在 <strong>存储 → 备份与迁移</strong>；也可通过 <code>docker exec pichost backup-export</code> 等 CLI 操作。详见 <a href=\"https://o96u.github.io/PicHost/guide/storage.html\" target=\"_blank\">存储文档</a>。"
+      }
+    ]
+  }
+]

@@ -1,0 +1,17 @@
+#!/bin/bash
+ACTION="${wizard_data_action:-keep}"
+
+if [ "$ACTION" = "delete" ]; then
+  DATA_DIR="/${TRIM_APPDEST_VOL}/@appshare/pichost/data"
+  if [ -d "${DATA_DIR}" ]; then
+    rm -rf "${DATA_DIR:?}"/*
+  fi
+  if [ -n "${TRIM_PKGVAR:-}" ] && [ -d "$TRIM_PKGVAR" ]; then
+    rm -rf "${TRIM_PKGVAR:?}"/*
+  fi
+  if [ -n "${TRIM_PKGETC:-}" ] && [ -d "$TRIM_PKGETC" ]; then
+    rm -rf "${TRIM_PKGETC:?}"/*
+  fi
+fi
+
+exit 0

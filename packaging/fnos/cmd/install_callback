@@ -1,0 +1,96 @@
+#!/bin/bash
+# 飞牛在此脚本阶段显示约 80%。只写文件并立刻返回，不要等待容器。
+DATA_DIR="/${TRIM_APPDEST_VOL}/@appshare/pichost/data"
+SETUP_FILE="${DATA_DIR}/.fnos-setup.json"
+RESTORE_PENDING="${DATA_DIR}/.fnos-restore.pending"
+BOOTSTRAP_SRC="$(cd "$(dirname "$0")" && pwd)/fnos-bootstrap.mjs"
+
+SETUP_MODE="${wizard_setup_mode:-init}"
+USERNAME="${wizard_admin_username:-admin}"
+PASSWORD="${wizard_admin_password:-}"
+ALLOW_REGISTRATION="${wizard_allow_registration:-false}"
+BACKUP_PATH="${wizard_backup_path:-}"
+PORT="${wizard_port:-6892}"
+
+log_fail() {
+  echo "$1" > "${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+}
+
+case "${PORT}" in
+  ''|*[!0-9]*)
+    log_fail "服务端口必须是数字。"
+    exit 1
+    ;;
+esac
+if [ "${PORT}" -lt 1024 ] || [ "${PORT}" -gt 65535 ]; then
+  log_fail "服务端口需在 1024–65535 之间。"
+  exit 1
+fi
+
+mkdir -p "${DATA_DIR}"
+
+rm -f "${SETUP_FILE}" "${RESTORE_PENDING}" "${DATA_DIR}/.fnos-restore.failed" 2>/dev/null || true
+
+case "${SETUP_MODE}" in
+  restore)
+    BACKUP_PATH="$(printf '%s' "${BACKUP_PATH}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if [ -z "${BACKUP_PATH}" ]; then
+      log_fail "请填写备份文件的 NAS 绝对路径。"
+      exit 1
+    fi
+    if [ ! -f "${BACKUP_PATH}" ]; then
+      log_fail "找不到备份文件：${BACKUP_PATH}"
+      exit 1
+    fi
+    case "${BACKUP_PATH}" in
+      *.phost.tar.gz|*.tar.gz) ;;
+      *)
+        log_fail "备份文件须为 .phost.tar.gz 或 .tar.gz 格式。"
+        exit 1
+        ;;
+    esac
+
+    mkdir -p "${DATA_DIR}/backups"
+    RESTORE_ARCHIVE="${DATA_DIR}/backups/fnos-setup-restore.phost.tar.gz"
+    cp "${BACKUP_PATH}" "${RESTORE_ARCHIVE}"
+    printf '/data/backups/fnos-setup-restore.phost.tar.gz\n' > "${RESTORE_PENDING}"
+    rm -f "${DATA_DIR}/fnos-bootstrap.mjs" 2>/dev/null || true
+    ;;
+  init|*)
+    if [ -z "${PASSWORD}" ]; then
+      log_fail "请设置管理员密码。"
+      exit 1
+    fi
+    case "${USERNAME}" in
+      '')
+        log_fail "请设置管理员用户名。"
+        exit 1
+        ;;
+    esac
+
+    if command -v python3 >/dev/null 2>&1; then
+      USERNAME="${USERNAME}" PASSWORD="${PASSWORD}" ALLOW_REGISTRATION="${ALLOW_REGISTRATION}" python3 - <<'PY' > "${SETUP_FILE}"
+import json, os
+print(json.dumps({
+    "username": os.environ["USERNAME"],
+    "password": os.environ["PASSWORD"],
+    "allowRegistration": os.environ.get("ALLOW_REGISTRATION", "false").lower() == "true",
+}))
+PY
+    else
+      case "${ALLOW_REGISTRATION}" in
+        true|TRUE|1|yes|on) ALLOW_JSON=true ;;
+        *) ALLOW_JSON=false ;;
+      esac
+      printf '{"username":"%s","password":"%s","allowRegistration":%s}\n' \
+        "${USERNAME}" "${PASSWORD}" "${ALLOW_JSON}" > "${SETUP_FILE}"
+    fi
+
+    if [ -f "${BOOTSTRAP_SRC}" ]; then
+      cp "${BOOTSTRAP_SRC}" "${DATA_DIR}/fnos-bootstrap.mjs"
+    fi
+    ;;
+esac
+
+docker restart -t 2 pichost >/dev/null 2>&1 || true
+exit 0

@@ -1,0 +1,843 @@
+import type { DatabaseSync } from 'node:sqlite'
+import { getDb } from './db'
+import { LocalStorageBackend } from './storage/local'
+import { deleteStorageObjectRefsForBackend } from './storage/storage-object-refs'
+import {
+  parseS3Config,
+  parseS3Secrets,
+  S3StorageBackend
+} from './storage/s3'
+import {
+  parseTelegramConfig,
+  parseTelegramSecrets,
+  TelegramStorageBackend
+} from './storage/telegram'
+import type {
+  S3BackendConfig,
+  ServingMode,
+  StorageBackendInfo,
+  StorageBackendRow,
+  StorageBackendType,
+  TelegramBackendConfig,
+  TelegramBackendSecrets
+} from './storage/types'
+
+export const LOCAL_BACKEND_ID = 'local'
+export const S3_BACKEND_ID = 's3-primary'
+
+const STORAGE_SCHEMA_TELEGRAM_KEY = 'storage_schema_telegram_v1'
+
+function migrateStorageBackendTelegramType(database: DatabaseSync): void {
+  const flag = database.prepare(`
+    SELECT value FROM settings WHERE key = ?
+  `).get(STORAGE_SCHEMA_TELEGRAM_KEY) as { value?: string } | undefined
+  if (flag?.value === '1') {
+    return
+  }
+
+  const tableRow = database.prepare(`
+    SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'storage_backends'
+  `).get() as { sql?: string } | undefined
+
+  const needsRebuild = Boolean(
+    tableRow?.sql && !tableRow.sql.includes('telegram')
+  )
+
+  if (!needsRebuild) {
+    database.prepare(`
+      INSERT OR REPLACE INTO settings (key, value, updated_at)
+      VALUES (?, '1', ?)
+    `).run(STORAGE_SCHEMA_TELEGRAM_KEY, new Date().toISOString())
+    return
+  }
+
+  database.exec('PRAGMA foreign_keys = OFF')
+  database.exec('BEGIN')
+  try {
+    database.exec(`
+      CREATE TABLE storage_backends_new (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        type TEXT NOT NULL CHECK(type IN ('local', 's3', 'telegram')),
+        config_json TEXT NOT NULL DEFAULT '{}',
+        secret_json TEXT NOT NULL DEFAULT '{}',
+        serving_mode TEXT NOT NULL DEFAULT 'proxy' CHECK(serving_mode IN ('proxy', 'public')),
+        public_url TEXT NOT NULL DEFAULT '',
+        quota_bytes INTEGER,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        is_default INTEGER NOT NULL DEFAULT 0,
+        sort_order INTEGER NOT NULL DEFAULT 0
+      )
+    `)
+    database.exec(`
+      INSERT INTO storage_backends_new
+      SELECT * FROM storage_backends
+    `)
+    database.exec('DROP TABLE storage_backends')
+    database.exec('ALTER TABLE storage_backends_new RENAME TO storage_backends')
+    database.prepare(`
+      INSERT OR REPLACE INTO settings (key, value, updated_at)
+      VALUES (?, '1', ?)
+    `).run(STORAGE_SCHEMA_TELEGRAM_KEY, new Date().toISOString())
+    database.exec('COMMIT')
+  } catch (error) {
+    database.exec('ROLLBACK')
+    throw error
+  } finally {
+    database.exec('PRAGMA foreign_keys = ON')
+  }
+}
+
+const STORAGE_SCHEMA_MEDIA_TYPE_KEY = 'storage_schema_media_type'
+const STORAGE_SCHEMA_TRANSCODE_KEY = 'storage_schema_transcode'
+const STORAGE_SCHEMA_TRANSCODE_PROGRESS_KEY = 'storage_schema_transcode_progress'
+const STORAGE_SCHEMA_THUMB_KEY = 'storage_schema_thumb'
+const STORAGE_SCHEMA_SOURCE_DELETED_KEY = 'storage_schema_source_deleted'
+const STORAGE_SCHEMA_TRANSCODE_PRESET_KEY = 'storage_schema_transcode_preset'
+const STORAGE_SCHEMA_TRANSCODE_ERROR_KEY = 'storage_schema_transcode_error'
+const STORAGE_SCHEMA_TRANSCODE_STARTED_KEY = 'storage_schema_transcode_started'
+const STORAGE_SCHEMA_TRANSCODE_DURATION_KEY = 'storage_schema_transcode_duration'
+
+/** images 表新增 media_type 列（区分图床图片与文件床文件） */
+function migrateImagesMediaType(database: DatabaseSync): void {
+  const migrated = database.prepare(`
+    SELECT value FROM settings WHERE key = ?
+  `).get(STORAGE_SCHEMA_MEDIA_TYPE_KEY) as { value?: string } | undefined
+
+  if (migrated?.value === '1') return
+
+  const columns = database.prepare('PRAGMA table_info(images)').all() as Array<{
+    name: string
+  }>
+  if (!columns.some(column => column.name === 'media_type')) {
+    database.exec(`
+      ALTER TABLE images ADD COLUMN media_type TEXT NOT NULL DEFAULT 'image'
+    `)
+  }
+
+  database.prepare(`
+    INSERT OR REPLACE INTO settings (key, value, updated_at)
+    VALUES (?, '1', ?)
+  `).run(STORAGE_SCHEMA_MEDIA_TYPE_KEY, new Date().toISOString())
+}
+
+/** images 表新增 HLS 转码相关列（hls_key / transcode_status） */
+function migrateImagesTranscode(database: DatabaseSync): void {
+  const migrated = database.prepare(`
+    SELECT value FROM settings WHERE key = ?
+  `).get(STORAGE_SCHEMA_TRANSCODE_KEY) as { value?: string } | undefined
+
+  if (migrated?.value === '1') return
+
+  const columns = database.prepare('PRAGMA table_info(images)').all() as Array<{
+    name: string
+  }>
+  if (!columns.some(column => column.name === 'hls_key')) {
+    database.exec('ALTER TABLE images ADD COLUMN hls_key TEXT')
+  }
+  if (!columns.some(column => column.name === 'transcode_status')) {
+    database.exec(`
+      ALTER TABLE images ADD COLUMN transcode_status TEXT NOT NULL DEFAULT 'none'
+    `)
+  }
+
+  database.prepare(`
+    INSERT OR REPLACE INTO settings (key, value, updated_at)
+    VALUES (?, '1', ?)
+  `).run(STORAGE_SCHEMA_TRANSCODE_KEY, new Date().toISOString())
+}
+
+/** images 表新增转码进度列（0–100） */
+function migrateImagesTranscodeProgress(database: DatabaseSync): void {
+  const migrated = database.prepare(`
+    SELECT value FROM settings WHERE key = ?
+  `).get(STORAGE_SCHEMA_TRANSCODE_PROGRESS_KEY) as { value?: string } | undefined
+
+  if (migrated?.value === '1') return
+
+  const columns = database.prepare('PRAGMA table_info(images)').all() as Array<{
+    name: string
+  }>
+  if (!columns.some(column => column.name === 'transcode_progress')) {
+    database.exec(`
+      ALTER TABLE images ADD COLUMN transcode_progress INTEGER NOT NULL DEFAULT 0
+    `)
+  }
+
+  database.prepare(`
+    INSERT OR REPLACE INTO settings (key, value, updated_at)
+    VALUES (?, '1', ?)
+  `).run(STORAGE_SCHEMA_TRANSCODE_PROGRESS_KEY, new Date().toISOString())
+}
+
+/** images 表新增视频缩略图列 */
+function migrateImagesThumb(database: DatabaseSync): void {
+  const migrated = database.prepare(`
+    SELECT value FROM settings WHERE key = ?
+  `).get(STORAGE_SCHEMA_THUMB_KEY) as { value?: string } | undefined
+
+  if (migrated?.value === '1') return
+
+  const columns = database.prepare('PRAGMA table_info(images)').all() as Array<{
+    name: string
+  }>
+  if (!columns.some(column => column.name === 'thumb_key')) {
+    database.exec('ALTER TABLE images ADD COLUMN thumb_key TEXT')
+  }
+
+  database.prepare(`
+    INSERT OR REPLACE INTO settings (key, value, updated_at)
+    VALUES (?, '1', ?)
+  `).run(STORAGE_SCHEMA_THUMB_KEY, new Date().toISOString())
+}
+
+/** images 表新增「源视频已删除」标记 */
+function migrateImagesSourceDeleted(database: DatabaseSync): void {
+  const migrated = database.prepare(`
+    SELECT value FROM settings WHERE key = ?
+  `).get(STORAGE_SCHEMA_SOURCE_DELETED_KEY) as { value?: string } | undefined
+
+  if (migrated?.value === '1') return
+
+  const columns = database.prepare('PRAGMA table_info(images)').all() as Array<{
+    name: string
+  }>
+  if (!columns.some(column => column.name === 'source_deleted')) {
+    database.exec(`
+      ALTER TABLE images ADD COLUMN source_deleted INTEGER NOT NULL DEFAULT 0
+    `)
+  }
+
+  database.prepare(`
+    INSERT OR REPLACE INTO settings (key, value, updated_at)
+    VALUES (?, '1', ?)
+  `).run(STORAGE_SCHEMA_SOURCE_DELETED_KEY, new Date().toISOString())
+}
+
+/** images 表新增「本视频使用的转码档位」列 */
+function migrateImagesTranscodePreset(database: DatabaseSync): void {
+  const migrated = database.prepare(`
+    SELECT value FROM settings WHERE key = ?
+  `).get(STORAGE_SCHEMA_TRANSCODE_PRESET_KEY) as { value?: string } | undefined
+
+  if (migrated?.value === '1') return
+
+  const columns = database.prepare('PRAGMA table_info(images)').all() as Array<{
+    name: string
+  }>
+  if (!columns.some(column => column.name === 'transcode_preset')) {
+    database.exec('ALTER TABLE images ADD COLUMN transcode_preset TEXT')
+  }
+
+  database.prepare(`
+    INSERT OR REPLACE INTO settings (key, value, updated_at)
+    VALUES (?, '1', ?)
+  `).run(STORAGE_SCHEMA_TRANSCODE_PRESET_KEY, new Date().toISOString())
+}
+
+/** images 表新增「转码失败原因」列 */
+function migrateImagesTranscodeError(database: DatabaseSync): void {
+  const migrated = database.prepare(`
+    SELECT value FROM settings WHERE key = ?
+  `).get(STORAGE_SCHEMA_TRANSCODE_ERROR_KEY) as { value?: string } | undefined
+
+  if (migrated?.value === '1') return
+
+  const columns = database.prepare('PRAGMA table_info(images)').all() as Array<{
+    name: string
+  }>
+  if (!columns.some(column => column.name === 'transcode_error')) {
+    database.exec('ALTER TABLE images ADD COLUMN transcode_error TEXT')
+  }
+
+  database.prepare(`
+    INSERT OR REPLACE INTO settings (key, value, updated_at)
+    VALUES (?, '1', ?)
+  `).run(STORAGE_SCHEMA_TRANSCODE_ERROR_KEY, new Date().toISOString())
+}
+
+/** images 表新增「转码开始时间」列 */
+function migrateImagesTranscodeStarted(database: DatabaseSync): void {
+  const migrated = database.prepare(`
+    SELECT value FROM settings WHERE key = ?
+  `).get(STORAGE_SCHEMA_TRANSCODE_STARTED_KEY) as { value?: string } | undefined
+
+  if (migrated?.value === '1') return
+
+  const columns = database.prepare('PRAGMA table_info(images)').all() as Array<{
+    name: string
+  }>
+  if (!columns.some(column => column.name === 'transcode_started_at')) {
+    database.exec('ALTER TABLE images ADD COLUMN transcode_started_at TEXT')
+  }
+
+  database.prepare(`
+    INSERT OR REPLACE INTO settings (key, value, updated_at)
+    VALUES (?, '1', ?)
+  `).run(STORAGE_SCHEMA_TRANSCODE_STARTED_KEY, new Date().toISOString())
+}
+
+/** images 表新增「转码总耗时」列 */
+function migrateImagesTranscodeDuration(database: DatabaseSync): void {
+  const migrated = database.prepare(`
+    SELECT value FROM settings WHERE key = ?
+  `).get(STORAGE_SCHEMA_TRANSCODE_DURATION_KEY) as { value?: string } | undefined
+
+  if (migrated?.value === '1') return
+
+  const columns = database.prepare('PRAGMA table_info(images)').all() as Array<{
+    name: string
+  }>
+  if (!columns.some(column => column.name === 'transcode_duration_ms')) {
+    database.exec('ALTER TABLE images ADD COLUMN transcode_duration_ms INTEGER')
+  }
+
+  database.prepare(`
+    INSERT OR REPLACE INTO settings (key, value, updated_at)
+    VALUES (?, '1', ?)
+  `).run(STORAGE_SCHEMA_TRANSCODE_DURATION_KEY, new Date().toISOString())
+}
+
+function migrateStorageTables(database: DatabaseSync): void {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS storage_backends (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      type TEXT NOT NULL CHECK(type IN ('local', 's3', 'telegram')),
+      config_json TEXT NOT NULL DEFAULT '{}',
+      secret_json TEXT NOT NULL DEFAULT '{}',
+      serving_mode TEXT NOT NULL DEFAULT 'proxy' CHECK(serving_mode IN ('proxy', 'public')),
+      public_url TEXT NOT NULL DEFAULT '',
+      quota_bytes INTEGER,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      is_default INTEGER NOT NULL DEFAULT 0,
+      sort_order INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS images (
+      key TEXT PRIMARY KEY,
+      backend_id TEXT NOT NULL,
+      user_id INTEGER,
+      folder TEXT NOT NULL,
+      original_name TEXT NOT NULL,
+      content_type TEXT NOT NULL,
+      size INTEGER NOT NULL,
+      uploaded_at TEXT NOT NULL,
+      media_type TEXT NOT NULL DEFAULT 'image',
+      hls_key TEXT,
+      transcode_status TEXT NOT NULL DEFAULT 'none',
+      transcode_progress INTEGER NOT NULL DEFAULT 0,
+      thumb_key TEXT,
+      source_deleted INTEGER NOT NULL DEFAULT 0,
+      transcode_preset TEXT,
+      transcode_error TEXT,
+      transcode_started_at TEXT,
+      transcode_duration_ms INTEGER,
+      FOREIGN KEY (backend_id) REFERENCES storage_backends(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_images_uploaded_at ON images(uploaded_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_images_backend_id ON images(backend_id);
+    CREATE INDEX IF NOT EXISTS idx_images_user_id ON images(user_id);
+    CREATE INDEX IF NOT EXISTS idx_images_folder ON images(folder);
+    CREATE TABLE IF NOT EXISTS storage_object_refs (
+      backend_id TEXT NOT NULL,
+      key TEXT NOT NULL,
+      ref_json TEXT NOT NULL,
+      PRIMARY KEY (backend_id, key),
+      FOREIGN KEY (backend_id) REFERENCES storage_backends(id)
+    );
+  `)
+  migrateStorageBackendTelegramType(database)
+  migrateImagesMediaType(database)
+  migrateImagesTranscode(database)
+  migrateImagesTranscodeProgress(database)
+  migrateImagesThumb(database)
+  migrateImagesSourceDeleted(database)
+  migrateImagesTranscodePreset(database)
+  migrateImagesTranscodeError(database)
+  migrateImagesTranscodeStarted(database)
+  migrateImagesTranscodeDuration(database)
+  database.exec(`
+    CREATE INDEX IF NOT EXISTS idx_images_media_type ON images(media_type);
+  `)
+}
+
+export function ensureStorageSchema(): void {
+  migrateStorageTables(getDb())
+}
+
+export function ensureDefaultBackends(): void {
+  ensureStorageSchema()
+  const db = getDb()
+
+  const local = db.prepare(`
+    SELECT id FROM storage_backends WHERE id = ?
+  `).get(LOCAL_BACKEND_ID)
+
+  if (!local) {
+    db.prepare(`
+      INSERT INTO storage_backends
+        (id, name, type, config_json, secret_json, serving_mode, public_url,
+         quota_bytes, enabled, is_default, sort_order)
+      VALUES (?, ?, 'local', '{}', '{}', 'proxy', '', NULL, 1, 1, 0)
+    `).run(LOCAL_BACKEND_ID, '本地磁盘')
+  }
+
+  cleanupPlaceholderS3Backend(db)
+}
+
+/** 移除早期版本自动种下的空 S3 占位（未配置、未启用、非默认、无图片） */
+function cleanupPlaceholderS3Backend(db: DatabaseSync): void {
+  const row = db.prepare(`
+    SELECT * FROM storage_backends WHERE id = ?
+  `).get(S3_BACKEND_ID) as StorageBackendRow | undefined
+
+  if (!row || row.type !== 's3' || row.is_default === 1) {
+    return
+  }
+
+  const config = parseS3Config(row.config_json)
+  const secrets = parseS3Secrets(row.secret_json)
+  const configured = Boolean(
+    config?.bucket?.trim()
+    || config?.endpoint?.trim()
+    || secrets?.accessKeyId?.trim()
+    || secrets?.secretAccessKey?.trim()
+  )
+  if (configured) {
+    return
+  }
+
+  const usage = getBackendUsageStats(S3_BACKEND_ID)
+  if (usage.count > 0) {
+    return
+  }
+
+  db.prepare('DELETE FROM storage_backends WHERE id = ?').run(S3_BACKEND_ID)
+}
+
+function rowToInfo(row: StorageBackendRow, _maskSecrets = true): StorageBackendInfo & {
+  secretsMasked: Record<string, string>
+} {
+  const config = row.type === 's3'
+    ? (parseS3Config(row.config_json) ?? {})
+    : row.type === 'telegram'
+      ? (parseTelegramConfig(row.config_json) ?? {})
+      : {}
+  let secretsMasked: Record<string, string> = {}
+  if (row.type === 's3') {
+    const secrets = parseS3Secrets(row.secret_json)
+    secretsMasked = {
+      accessKeyId: secrets?.accessKeyId
+        ? maskSecret(secrets.accessKeyId)
+        : '',
+      secretAccessKey: secrets?.secretAccessKey
+        ? maskSecret(secrets.secretAccessKey)
+        : ''
+    }
+  } else if (row.type === 'telegram') {
+    const secrets = parseTelegramSecrets(row.secret_json)
+    secretsMasked = {
+      botToken: secrets?.botToken ? maskSecret(secrets.botToken) : ''
+    }
+  }
+
+  return {
+    id: row.id,
+    name: row.name,
+    type: row.type,
+    config,
+    servingMode: row.serving_mode,
+    publicUrl: row.public_url,
+    quotaBytes: row.quota_bytes,
+    enabled: row.enabled === 1,
+    isDefault: row.is_default === 1,
+    sortOrder: row.sort_order,
+    secretsMasked
+  }
+}
+
+function maskSecret(value: string): string {
+  if (value.length <= 4) return '****'
+  return `${value.slice(0, 4)}${'*'.repeat(Math.min(8, value.length - 4))}`
+}
+
+export function listStorageBackendRows(): StorageBackendRow[] {
+  ensureDefaultBackends()
+  return getDb().prepare(`
+    SELECT id, name, type, config_json, secret_json, serving_mode, public_url,
+           quota_bytes, enabled, is_default, sort_order
+    FROM storage_backends
+    ORDER BY sort_order ASC, id ASC
+  `).all() as unknown as StorageBackendRow[]
+}
+
+export function listStorageBackends(maskSecrets = true): Array<StorageBackendInfo & {
+  secretsMasked: Record<string, string>
+}> {
+  return listStorageBackendRows().map(row => rowToInfo(row, maskSecrets))
+}
+
+export function listStorageBackendNameMap(): Map<string, {
+  name: string
+  type: StorageBackendType
+}> {
+  ensureStorageSchema()
+  const rows = getDb().prepare(`
+    SELECT id, name, type FROM storage_backends
+  `).all() as Array<{ id: string, name: string, type: StorageBackendType }>
+  return new Map(rows.map(row => [row.id, { name: row.name, type: row.type }]))
+}
+
+export function getStorageBackendRow(id: string): StorageBackendRow | null {
+  ensureDefaultBackends()
+  const row = getDb().prepare(`
+    SELECT id, name, type, config_json, secret_json, serving_mode, public_url,
+           quota_bytes, enabled, is_default, sort_order
+    FROM storage_backends
+    WHERE id = ?
+  `).get(id) as StorageBackendRow | undefined
+  return row ?? null
+}
+
+export function getDefaultBackendRow(): StorageBackendRow | null {
+  ensureDefaultBackends()
+  const row = getDb().prepare(`
+    SELECT id, name, type, config_json, secret_json, serving_mode, public_url,
+           quota_bytes, enabled, is_default, sort_order
+    FROM storage_backends
+    WHERE is_default = 1 AND enabled = 1
+    LIMIT 1
+  `).get() as StorageBackendRow | undefined
+  return row ?? null
+}
+
+export function getBackendIdForKey(key: string): string | null {
+  ensureStorageSchema()
+  const row = getDb().prepare(`
+    SELECT backend_id FROM images WHERE key = ?
+  `).get(key) as { backend_id: string } | undefined
+  return row?.backend_id ?? null
+}
+
+export function setDefaultBackend(id: string): void {
+  ensureDefaultBackends()
+  const db = getDb()
+  db.exec('UPDATE storage_backends SET is_default = 0')
+  db.prepare(`
+    UPDATE storage_backends SET is_default = 1, enabled = 1 WHERE id = ?
+  `).run(id)
+}
+
+export interface StorageBackendPatch {
+  name?: string
+  config?: Record<string, unknown>
+  secrets?: {
+    accessKeyId?: string
+    secretAccessKey?: string
+    botToken?: string
+  }
+  servingMode?: ServingMode
+  publicUrl?: string
+  quotaBytes?: number | null
+  enabled?: boolean
+  isDefault?: boolean
+}
+
+export function updateStorageBackend(id: string, patch: StorageBackendPatch): void {
+  const row = getStorageBackendRow(id)
+  if (!row) {
+    throw new Error(`Storage backend not found: ${id}`)
+  }
+
+  const name = patch.name ?? row.name
+  let configJson = row.config_json
+  let secretJson = row.secret_json
+
+  if (patch.config !== undefined) {
+    const current = row.type === 's3'
+      ? (parseS3Config(row.config_json) ?? {})
+      : row.type === 'telegram'
+        ? (parseTelegramConfig(row.config_json) ?? { chatId: '' })
+        : {}
+    configJson = JSON.stringify({ ...current, ...patch.config })
+  }
+
+  if (patch.secrets !== undefined && row.type === 's3') {
+    const current = parseS3Secrets(row.secret_json) ?? {
+      accessKeyId: '',
+      secretAccessKey: ''
+    }
+    const next = {
+      accessKeyId: patch.secrets.accessKeyId?.trim()
+        ? patch.secrets.accessKeyId.trim()
+        : current.accessKeyId,
+      secretAccessKey: patch.secrets.secretAccessKey?.trim()
+        ? patch.secrets.secretAccessKey.trim()
+        : current.secretAccessKey
+    }
+    secretJson = JSON.stringify(next)
+  }
+
+  if (patch.secrets !== undefined && row.type === 'telegram') {
+    const current = parseTelegramSecrets(row.secret_json) ?? { botToken: '' }
+    const next = {
+      botToken: patch.secrets.botToken?.trim()
+        ? patch.secrets.botToken.trim()
+        : current.botToken
+    }
+    secretJson = JSON.stringify(next)
+  }
+
+  let servingMode = patch.servingMode ?? row.serving_mode
+  if (row.type === 'telegram') {
+    servingMode = 'proxy'
+  }
+  const publicUrl = patch.publicUrl ?? row.public_url
+  const quotaBytes = patch.quotaBytes !== undefined
+    ? patch.quotaBytes
+    : row.quota_bytes
+  const enabled = patch.enabled !== undefined
+    ? (patch.enabled ? 1 : 0)
+    : row.enabled
+
+  getDb().prepare(`
+    UPDATE storage_backends
+    SET name = ?, config_json = ?, secret_json = ?, serving_mode = ?,
+        public_url = ?, quota_bytes = ?, enabled = ?
+    WHERE id = ?
+  `).run(name, configJson, secretJson, servingMode, publicUrl, quotaBytes, enabled, id)
+
+  if (patch.isDefault) {
+    setDefaultBackend(id)
+  }
+}
+
+export function isStorageEnvConfigured(): boolean {
+  return getStorageBackendFromEnv() !== null
+}
+
+export function getStorageBackendFromEnv(): {
+  type: StorageBackendType
+  config: Record<string, unknown>
+  secrets: { accessKeyId: string, secretAccessKey: string }
+  servingMode: ServingMode
+  publicUrl: string
+} | null {
+  const backendType = process.env.STORAGE_BACKEND?.trim()
+  if (backendType !== 's3') return null
+
+  const endpoint = process.env.S3_ENDPOINT?.trim() ?? ''
+  const region = process.env.S3_REGION?.trim() ?? ''
+  const bucket = process.env.S3_BUCKET?.trim() ?? ''
+  const accessKeyId = process.env.S3_ACCESS_KEY?.trim() ?? ''
+  const secretAccessKey = process.env.S3_SECRET_KEY?.trim() ?? ''
+
+  if (!endpoint || !bucket || !accessKeyId || !secretAccessKey) {
+    return null
+  }
+
+  return {
+    type: 's3',
+    config: {
+      endpoint,
+      region: region || 'auto',
+      bucket,
+      prefix: process.env.S3_PREFIX?.trim() || undefined,
+      forcePathStyle: process.env.S3_FORCE_PATH_STYLE === 'true'
+    },
+    secrets: { accessKeyId, secretAccessKey },
+    servingMode: process.env.S3_PUBLIC_URL?.trim() ? 'public' : 'proxy',
+    publicUrl: process.env.S3_PUBLIC_URL?.trim() ?? ''
+  }
+}
+
+export function createBackendInstance(row: StorageBackendRow) {
+  if (row.type === 'local') {
+    return new LocalStorageBackend(
+      row.id,
+      row.serving_mode,
+      row.public_url
+    )
+  }
+
+  if (row.type === 'telegram') {
+    const config = parseTelegramConfig(row.config_json)
+    const secrets = parseTelegramSecrets(row.secret_json)
+    if (!config || !secrets) {
+      throw new Error(`Invalid Telegram configuration for backend ${row.id}`)
+    }
+    return new TelegramStorageBackend(row.id, config, secrets)
+  }
+
+  const config = parseS3Config(row.config_json)
+  const secrets = parseS3Secrets(row.secret_json)
+  if (!config || !secrets) {
+    throw new Error(`Invalid S3 configuration for backend ${row.id}`)
+  }
+
+  return new S3StorageBackend(
+    row.id,
+    config,
+    secrets,
+    row.serving_mode,
+    row.public_url
+  )
+}
+
+export function createBackendFromEnv() {
+  const env = getStorageBackendFromEnv()
+  if (!env) return null
+
+  return new S3StorageBackend(
+    S3_BACKEND_ID,
+    env.config as unknown as S3BackendConfig,
+    env.secrets,
+    env.servingMode,
+    env.publicUrl
+  )
+}
+
+export function getBackendUsageStats(backendId: string): { count: number, bytes: number } {
+  ensureStorageSchema()
+  const row = getDb().prepare(`
+    SELECT COUNT(*) AS count, COALESCE(SUM(size), 0) AS bytes
+    FROM images
+    WHERE backend_id = ?
+  `).get(backendId) as { count: number, bytes: number }
+  return { count: row.count, bytes: row.bytes }
+}
+
+function getNextSortOrder(): number {
+  const row = getDb().prepare(`
+    SELECT COALESCE(MAX(sort_order), 0) AS max_order FROM storage_backends
+  `).get() as { max_order: number }
+  return row.max_order + 1
+}
+
+export type ObjectStorageIdPrefix = 'r2' | 'cos' | 'oss' | 's3' | 'tg'
+
+/** 根据表单预设或 endpoint 推断新建后端的 id 前缀 */
+export function resolveObjectStorageIdPrefix(
+  config: Pick<S3BackendConfig, 'endpoint'>,
+  provider?: string
+): ObjectStorageIdPrefix {
+  const normalized = provider?.trim().toLowerCase()
+  if (normalized === 'r2' || normalized === 'cos' || normalized === 'oss') {
+    return normalized
+  }
+  if (normalized === 'aws' || normalized === 's3') {
+    return 's3'
+  }
+
+  const endpoint = config.endpoint.trim().toLowerCase()
+  if (endpoint.includes('r2.cloudflarestorage.com')) return 'r2'
+  if (endpoint.includes('myqcloud.com')) return 'cos'
+  if (endpoint.includes('aliyuncs.com')) return 'oss'
+  return 's3'
+}
+
+export function generateStorageBackendId(prefix: ObjectStorageIdPrefix = 's3'): string {
+  const bytes = new Uint8Array(4)
+  crypto.getRandomValues(bytes)
+  const suffix = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('')
+  return `${prefix}-${suffix}`
+}
+
+export function insertStorageBackend(input: {
+  id?: string
+  name: string
+  provider?: string
+  config: S3BackendConfig
+  secrets: { accessKeyId: string, secretAccessKey: string }
+  servingMode?: ServingMode
+  publicUrl?: string
+  quotaBytes?: number | null
+  enabled?: boolean
+  isDefault?: boolean
+}): string {
+  ensureDefaultBackends()
+  const idPrefix = resolveObjectStorageIdPrefix(input.config, input.provider)
+  const id = input.id ?? generateStorageBackendId(idPrefix)
+  const sortOrder = getNextSortOrder()
+
+  getDb().prepare(`
+    INSERT INTO storage_backends
+      (id, name, type, config_json, secret_json, serving_mode, public_url,
+       quota_bytes, enabled, is_default, sort_order)
+    VALUES (?, ?, 's3', ?, ?, ?, ?, ?, ?, 0, ?)
+  `).run(
+    id,
+    input.name,
+    JSON.stringify(input.config),
+    JSON.stringify(input.secrets),
+    input.servingMode ?? 'proxy',
+    input.publicUrl ?? '',
+    input.quotaBytes ?? null,
+    input.enabled === false ? 0 : 1,
+    sortOrder
+  )
+
+  if (input.isDefault) {
+    setDefaultBackend(id)
+  }
+
+  return id
+}
+
+export function insertTelegramBackend(input: {
+  id?: string
+  name: string
+  config: TelegramBackendConfig
+  secrets: TelegramBackendSecrets
+  quotaBytes?: number | null
+  enabled?: boolean
+  isDefault?: boolean
+}): string {
+  ensureDefaultBackends()
+  const id = input.id ?? generateStorageBackendId('tg')
+  const sortOrder = getNextSortOrder()
+
+  getDb().prepare(`
+    INSERT INTO storage_backends
+      (id, name, type, config_json, secret_json, serving_mode, public_url,
+       quota_bytes, enabled, is_default, sort_order)
+    VALUES (?, ?, 'telegram', ?, ?, 'proxy', '', ?, ?, 0, ?)
+  `).run(
+    id,
+    input.name,
+    JSON.stringify(input.config),
+    JSON.stringify(input.secrets),
+    input.quotaBytes ?? null,
+    input.enabled === false ? 0 : 1,
+    sortOrder
+  )
+
+  if (input.isDefault) {
+    setDefaultBackend(id)
+  }
+
+  return id
+}
+
+export function deleteStorageBackend(id: string): void {
+  if (id === LOCAL_BACKEND_ID) {
+    throw new Error('Cannot delete local backend')
+  }
+
+  const usage = getBackendUsageStats(id)
+  if (usage.count > 0) {
+    throw new Error('Cannot delete backend with stored images')
+  }
+
+  const row = getStorageBackendRow(id)
+  if (!row) {
+    throw new Error(`Storage backend not found: ${id}`)
+  }
+
+  if (row.is_default) {
+    throw new Error('Cannot delete the default backend')
+  }
+
+  deleteStorageObjectRefsForBackend(id)
+  getDb().prepare('DELETE FROM storage_backends WHERE id = ?').run(id)
+}

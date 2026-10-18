@@ -1,0 +1,4 @@
+#!/bin/bash
+DATA_DIR="/${TRIM_APPDEST_VOL}/@appshare/pichost/data"
+mkdir -p "${DATA_DIR}" 2>/dev/null || true
+exit 0

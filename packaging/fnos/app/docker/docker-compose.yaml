@@ -1,0 +1,12 @@
+services:
+  pichost:
+    image: yeomaiyelove/pichost:1.5.1
+    pull_policy: never
+    container_name: pichost
+    restart: unless-stopped
+    ports:
+      - "${wizard_port}:6892"
+    volumes:
+      - "/${TRIM_APPDEST_VOL}/@appshare/pichost/data:/data"
+      - "${TRIM_APPDEST}/docker/start.sh:/fnos-start.sh:ro"
+    entrypoint: ["/bin/sh", "/fnos-start.sh"]

@@ -1,0 +1,16 @@
+node_modules
+.output
+.nuxt
+.git
+.github
+data
+dist
+dist-fpk
+dist-windows
+dist-docker
+packaging
+scripts
+.env
+*.md
+._*
+.DS_Store
